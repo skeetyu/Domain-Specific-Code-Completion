@@ -3,7 +3,7 @@
 In this project, we propose a collaborative inference framework incorporating the speculative decoding algorithm to effectively combine the completion results of large and small code models with a well-designed classifier, for better domain-specific code completion tasks.
 
 
-## Project structure
+## Project Structure
 
 - **code**: The implementation code and script files.
 - **dataset**: The directory for storing the dataset.
@@ -11,7 +11,7 @@ In this project, we propose a collaborative inference framework incorporating th
 - **env.yaml**: The environment configuration.
 
 
-## Train and evaluate
+## Train and Evaluate
 
 The workflow of the entire framework mainly consists of the following four steps:
 

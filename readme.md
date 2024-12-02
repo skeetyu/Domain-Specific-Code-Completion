@@ -65,6 +65,7 @@ Please ensure the following args with your actual paths:
 #### Our approach
 
 run `csd.sh`
+
 Please ensure the following args with your actual paths:
 - **dataset**: to load the data for completion
 - **output_dir**: to save the prediction resulsts

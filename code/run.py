@@ -7,13 +7,14 @@ import torch
 
 from tqdm import tqdm
 
-from decoding import Generator
+from decoding import Generator, Bild_Generator, Raw_SD_Generator
 from classifier import ClassifierDataCollector, Classifier
 from utils import set_seed
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from fuzzywuzzy import fuzz
+from auto_gptq import exllama_set_max_input_length
 
 def logger_setup(log_dir, log_file):
     if not os.path.exists(log_dir):
@@ -41,6 +42,9 @@ def main(args):
     logger.info("Training/Evaluation parameters %s", args)
 
     set_seed(args.seed)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
+    args.cuda = "0"
 
     # Load dataset
     with open(args.dataset, 'r') as f:
@@ -70,10 +74,14 @@ def main(args):
         raise NotImplementedError('Load not implemented model')
 
     # Load small model
-    if args.collect_classifier_data or args.with_sd:
+    if args.collect_classifier_data or args.with_sd or args.bild or args.raw_sd:
         logger.info(f'Loading small model: {args.small_model_ckpt}')
         if args.small_model_type in ['deepseek-coder', 'starcoder2']:
-            small_model = AutoModelForCausalLM.from_pretrained(args.small_model_ckpt, torch_dtype=torch.bfloat16, device_map=device)
+            # small_model = AutoModelForCausalLM.from_pretrained(args.small_model_ckpt, torch_dtype=torch.bfloat16, device_map=device)
+
+            small_model = AutoModelForCausalLM.from_pretrained(args.small_model_ckpt, torch_dtype=torch.float16, device_map=device)    # for auto-gptq
+
+            small_model = exllama_set_max_input_length(small_model, max_input_length=8192)
 
             if args.small_model_lora:
                 logger.info(f'Loading small model\'s adapter from {args.small_model_lora}')
@@ -295,6 +303,103 @@ def main(args):
         logger.info(f'Write predictions in {output_file}')
         logger.info(f'EM_cnt: {em}, Edit Sim: {es/total}, EM: {em/total}')
 
+    if args.bild:
+        generator = Bild_Generator(
+            l_model=large_model,
+            l_model_type=args.large_model_type,
+            tokenizer=tokenizer,
+            device=device,
+            lang=args.lang,
+            s_model=small_model,
+            s_model_type=args.small_model_type,
+            fallback_th=args.fallback_th,
+            rollback_th=args.rollback_th
+        )
+
+        preds = []
+        logger.info(f'Evaluating {len(eval_dataset)} case with bild methods ...')
+
+        es = 0
+        em = 0
+        total = len(eval_dataset)
+
+        for eval_case in tqdm(eval_dataset):
+            eval_case = json.loads(eval_case)
+            input = eval_case['input'].replace(" <EOL> ", "\n")
+            input_ids = tokenizer(input, return_tensors="pt").input_ids
+            
+            gt = eval_case['gt']
+
+            pred = generator.sd_bild(
+                input_ids=input_ids,
+                max_gen_len=args.max_gen_len,
+                max_draft_len=args.max_draft_len
+            )
+            preds.append(pred)
+
+            es += fuzz.ratio(gt.strip(), pred.strip())
+            em += 1 if gt.strip() == pred.strip() else 0
+
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+        
+        if args.fallback_th is not None and args.rollback_th is not None:
+            output_file = os.path.join(args.output_dir, f'{args.predictions}_{args.fallback_th}_{args.rollback_th}.txt')
+        else:
+            output_file = os.path.join(args.output_dir, f'{args.predictions}.txt')
+
+        with open(output_file, 'w') as wf:
+            for pred in preds:
+                wf.write(f'{pred}\n')
+        logger.info(f'Write predictions in {output_file}')
+        logger.info(f'EM_cnt: {em}, Edit Sim: {es/total}, EM: {em/total}')
+
+    if args.raw_sd:
+        generator = Raw_SD_Generator(
+            l_model=large_model,
+            l_model_type=args.large_model_type,
+            tokenizer=tokenizer,
+            device=device,
+            lang=args.lang,
+            s_model=small_model,
+            s_model_type=args.small_model_type,
+        )
+
+        preds = []
+        logger.info(f'Evaluating {len(eval_dataset)} case with raw sd methods ...')
+
+        es = 0
+        em = 0
+        total = len(eval_dataset)
+
+        for eval_case in tqdm(eval_dataset):
+            eval_case = json.loads(eval_case)
+            input = eval_case['input'].replace(" <EOL> ", "\n")
+            input_ids = tokenizer(input, return_tensors="pt").input_ids
+            
+            gt = eval_case['gt']
+
+            pred = generator.speculative_decoding(
+                input_ids=input_ids,
+                max_gen_len=args.max_gen_len,
+                max_draft_len=args.max_draft_len
+            )
+            preds.append(pred)
+
+            es += fuzz.ratio(gt.strip(), pred.strip())
+            em += 1 if gt.strip() == pred.strip() else 0
+
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+        
+        output_file = os.path.join(args.output_dir, f'{args.predictions}.txt')
+
+        with open(output_file, 'w') as wf:
+            for pred in preds:
+                wf.write(f'{pred}\n')
+        logger.info(f'Write predictions in {output_file}')
+        logger.info(f'EM_cnt: {em}, Edit Sim: {es/total}, EM: {em/total}')
+
     logger.info('Done!')
 
 if __name__ == "__main__":
@@ -337,7 +442,7 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", type=int, default=2,
                         help="The device where loads the models")
     
-    parser.add_argument("--lang", type=str, choices=['python', 'java'],
+    parser.add_argument("--lang", type=str, required=True, choices=['python', 'java'],
                         help="The language of the code to be completed")
     parser.add_argument("--max_gen_len", default=64, type=int,
                         help="Max length of generated codes")
@@ -361,7 +466,17 @@ if __name__ == "__main__":
                         help="The input size of the classifier MLP network")
     parser.add_argument("--classifier_scale_size", type=int,
                         help="The scale size of the classifier MLP network")
+
+    parser.add_argument("--bild", action="store_true",
+                        help="Whether to run baseline of bild method")
+    parser.add_argument("--fallback_th", type=float,
+                        help="Fallback threshold for bild method")
+    parser.add_argument("--rollback_th", type=float,
+                        help="Rollback threshold for bild method")
     
+    parser.add_argument("--raw_sd", action="store_true",
+                        help="Whether to run baseline of raw sd methods with acceptance with certain probabilities")
+
     args = parser.parse_args()
 
     if (args.baseline or args.with_sd) and args.predictions is None:
